@@ -101,3 +101,84 @@ echo "== 15) 查询指定运营日适用规则与覆盖区间 =="
 curl -s "$BASE/rules/2026-10-06" | j; echo
 echo "-- 全部已发布规则（按生效日升序） --"
 curl -s "$BASE/rules" | j; echo
+
+echo "== 16) 批量原子结算：一批提交两程（10-08 适用 60 分钟窗口/封顶 500） =="
+curl -s -X POST "$BASE/batch/trips" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"op\":\"submit\",\"trip_id\":\"B1\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T08:00:00+08:00\",\"base_fare_cents\":200},
+    {\"op\":\"submit\",\"trip_id\":\"B2\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T10:00:00+08:00\",\"base_fare_cents\":700}
+  ]
+}" | j; echo
+echo "-- 10-08 日结：间隔120分钟拆两组 200+700=900，封顶 500 --"
+curl -s "$BASE/accounts/$ACC/days/2026-10-08" | j; echo
+
+echo "== 16b) 第二批：B1 更正为 800（expected_version=1），受影响日只重算一次 =="
+curl -s -X POST "$BASE/batch/trips" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"op\":\"correct\",\"trip_id\":\"B1\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T08:00:00+08:00\",
+     \"base_fare_cents\":800,\"expected_version\":1}
+  ]
+}" | j; echo
+echo "-- 10-08 日结：800+700=1500，封顶 500 --"
+curl -s "$BASE/accounts/$ACC/days/2026-10-08" | j; echo
+
+echo "== 17) 批量含一项版本冲突（409 VERSION_CONFLICT + 出错位置 index），整批回滚 =="
+curl -s -X POST "$BASE/batch/trips" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"op\":\"submit\",\"trip_id\":\"B9\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T12:00:00+08:00\",\"base_fare_cents\":100},
+    {\"op\":\"correct\",\"trip_id\":\"B1\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T08:00:00+08:00\",
+     \"base_fare_cents\":900,\"expected_version\":1}
+  ]
+}" | j; echo
+echo "-- B9 随整批回滚，应查不到（404 UNKNOWN_TRIP）；B1 票价仍为 800、版本 2 --"
+curl -s -o /dev/null -w "GET /trips/B9 -> HTTP %{http_code}\n" "$BASE/trips/B9"
+curl -s "$BASE/trips/B1" | j; echo
+
+echo "== 18) 混合批：B1 同内容更正重放（幂等）+ B2 撤销（生效） =="
+curl -s -X POST "$BASE/batch/trips" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"op\":\"correct\",\"trip_id\":\"B1\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T08:00:00+08:00\",
+     \"base_fare_cents\":800,\"expected_version\":2},
+    {\"op\":\"cancel\",\"trip_id\":\"B2\",\"expected_version\":1}
+  ]
+}" | j; echo
+echo "== 18b) 重发同一批：B2 同版本重复撤销亦幂等 -> 整批 idempotent=true、无受影响日 =="
+curl -s -X POST "$BASE/batch/trips" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"op\":\"correct\",\"trip_id\":\"B1\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T08:00:00+08:00\",
+     \"base_fare_cents\":800,\"expected_version\":2},
+    {\"op\":\"cancel\",\"trip_id\":\"B2\",\"expected_version\":1}
+  ]
+}" | j; echo
+
+echo "== 19) 批内同一乘次号出现两次（422 DUPLICATE_TRIP_IN_BATCH，附 index/first_index） =="
+curl -s -X POST "$BASE/batch/trips" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"op\":\"submit\",\"trip_id\":\"DUP\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T08:00:00+08:00\",\"base_fare_cents\":100},
+    {\"op\":\"cancel\",\"trip_id\":\"DUP\",\"expected_version\":1}
+  ]
+}" | j; echo
+
+echo "== 20) 跨账户/跨日批量更正：新旧受影响日汇总，每日只重算一次 =="
+curl -s -X POST "$BASE/batch/trips" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"op\":\"correct\",\"trip_id\":\"B1\",\"account_id\":\"$ACC-ALT\",
+     \"boarding_at\":\"2026-10-09T08:00:00+08:00\",
+     \"base_fare_cents\":800,\"expected_version\":2},
+    {\"op\":\"submit\",\"trip_id\":\"B3\",\"account_id\":\"$ACC\",
+     \"boarding_at\":\"2026-10-08T11:00:00+08:00\",\"base_fare_cents\":300}
+  ]
+}" | j; echo
+echo "-- 原账户 10-08：B1 已更正走、B2 已撤销，仅剩 B3，实收 300 --"
+curl -s "$BASE/accounts/$ACC/days/2026-10-08" | j; echo
+echo "-- 新账户 $ACC-ALT 的 10-09：适用最新发布规则（封顶500），800 实收 500 --"
+curl -s "$BASE/accounts/$ACC-ALT/days/2026-10-09" | j; echo
+

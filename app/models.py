@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -192,6 +192,130 @@ class RulePublishView(BaseModel):
     recalculated_account_days: int             # 覆盖区间内被重算的账户运营日数
 
 
+# ------------------------------------------------------------ 批量原子结算
+
+MAX_BATCH_ITEMS = 100
+
+
+class BatchSubmitItem(BaseModel):
+    """批量项：提交乘次，字段与 POST /trips 一一对应。"""
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["submit"]
+    trip_id: str
+    account_id: str
+    boarding_at: datetime
+    base_fare_cents: int
+
+    @field_validator("trip_id")
+    @classmethod
+    def _tid(cls, v: Any) -> str:
+        return _validate_text(v, "trip_id")
+
+    @field_validator("account_id")
+    @classmethod
+    def _acc(cls, v: Any) -> str:
+        return _validate_text(v, "account_id")
+
+    @field_validator("boarding_at")
+    @classmethod
+    def _time(cls, v: Any) -> datetime:
+        return _validate_boarding_at(v)
+
+    @field_validator("base_fare_cents")
+    @classmethod
+    def _fare(cls, v: Any) -> int:
+        return _validate_fare(v)
+
+
+class BatchCorrectItem(BaseModel):
+    """批量项：更正乘次，字段与 POST /trips/{trip_id}/correct 一一对应。"""
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["correct"]
+    trip_id: str
+    account_id: str
+    boarding_at: datetime
+    base_fare_cents: int
+    expected_version: int = Field(..., ge=1,
+                                  description="乘次当前版本，陈旧版本将被拒绝")
+
+    @field_validator("trip_id")
+    @classmethod
+    def _tid(cls, v: Any) -> str:
+        return _validate_text(v, "trip_id")
+
+    @field_validator("account_id")
+    @classmethod
+    def _acc(cls, v: Any) -> str:
+        return _validate_text(v, "account_id")
+
+    @field_validator("boarding_at")
+    @classmethod
+    def _time(cls, v: Any) -> datetime:
+        return _validate_boarding_at(v)
+
+    @field_validator("base_fare_cents")
+    @classmethod
+    def _fare(cls, v: Any) -> int:
+        return _validate_fare(v)
+
+
+class BatchCancelItem(BaseModel):
+    """批量项：撤销乘次；expected_version 随请求体携带（单笔接口为查询参数）。
+
+    与单笔 cancel 查询参数一致，不在入参层限定 >=1：0 或陈旧版本交由
+    业务层判定（未知乘次 404 / 版本不符 409）。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["cancel"]
+    trip_id: str
+    expected_version: int
+
+    @field_validator("trip_id")
+    @classmethod
+    def _tid(cls, v: Any) -> str:
+        return _validate_text(v, "trip_id")
+
+
+BatchItem = Annotated[
+    BatchSubmitItem | BatchCorrectItem | BatchCancelItem,
+    Field(discriminator="op"),
+]
+
+
+class BatchSettleIn(BaseModel):
+    """清分方补录文件：1～100 个乘次操作作为一次原子结算。"""
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[BatchItem] = Field(..., min_length=1, max_length=MAX_BATCH_ITEMS)
+
+
+class BatchItemResultView(BaseModel):
+    """逐项结果：乘次最终状态 + 该操作是否命中幂等。"""
+    index: int
+    op: Literal["submit", "correct", "cancel"]
+    trip_id: str
+    idempotent: bool
+    trip: TripView
+
+
+class AffectedDayView(BaseModel):
+    """受影响（账户 × 运营日）重算后的实收（每日只重算一次）。"""
+    account_id: str
+    op_day: date
+    charged_cents: int
+    sum_group_fare_cents: int
+    daily_cap_cents: int
+
+
+class BatchSettleView(BaseModel):
+    idempotent: bool                  # 全部项均为幂等重放时为 true（无任何写入）
+    results: list[BatchItemResultView]
+    affected_days: list[AffectedDayView]
+
+
 class LedgerView(BaseModel):
     seq: int
     account_id: str
@@ -202,3 +326,4 @@ class LedgerView(BaseModel):
     charged_after_cents: int | None
     reason: str
     created_at: str
+
