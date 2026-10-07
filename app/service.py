@@ -13,7 +13,7 @@ import psycopg
 
 from .config import settings
 from . import db
-from .errors import ApiError, conflict, not_found
+from .errors import ApiError, conflict, not_found, unprocessable
 from .models import (DayView, GroupView, LedgerView, RulePublishView, RuleView,
                      TripView)
 from .timeutil import op_day_of, to_beijing_iso
@@ -449,90 +449,154 @@ def _same_content(existing: TripRow, account_id: str,
             and existing["base_fare_cents"] == fare)
 
 
+def _affected_sorted(pairs: set[tuple[str, date]]) -> list[tuple[str, date]]:
+    """受影响（账户 × 运营日）的确定序：仅用于流水序号可复现，无业务含义。"""
+    return sorted(pairs)
+
+
+def _submit_locked(conn: psycopg.Connection, trip_id: str, account_id: str,
+                   boarding_at: datetime, fare: int,
+                   ) -> tuple[TripRow, bool, set[tuple[str, date]]]:
+    """单笔“提交”原语（调用方已持有事务与 advisory 锁）。
+
+    返回 (应用后的乘次行, 是否幂等重传, 受影响账户运营日集合)；
+    不在此处重算，由调用方按需要重算（批量结算时每日只重算一次）。
+    """
+    op_day = op_day_of(boarding_at)
+    existing = conn.execute(
+        "SELECT * FROM trips WHERE trip_id = %s FOR UPDATE",
+        (trip_id,),
+    ).fetchone()
+
+    if existing is not None:
+        if _same_content(existing, account_id, boarding_at, fare):
+            return existing, True, set()  # 同号同内容：幂等，直接回当前状态
+        raise conflict(
+            "IDEMPOTENCY_CONFLICT",
+            f"trip {trip_id!r} already exists with different content; "
+            "use POST /trips/{trip_id}/correct to amend it",
+        )
+
+    row = conn.execute(
+        """INSERT INTO trips
+               (trip_id, account_id, boarding_at, base_fare_cents,
+                status, op_day, version)
+           VALUES (%s, %s, %s, %s, 'active', %s, 1)
+           RETURNING *""",
+        (trip_id, account_id, boarding_at, fare, op_day),
+    ).fetchone()
+    _append_ledger(conn, account_id=account_id, op_day=op_day,
+                   event_type="trip_posted", delta=0,
+                   charged_after=None,
+                   reason="trip submitted", trip_id=trip_id)
+    return row, False, {(account_id, op_day)}
+
+
+def _correct_locked(conn: psycopg.Connection, trip_id: str, account_id: str,
+                    boarding_at: datetime, fare: int, expected_version: int,
+                    ) -> tuple[TripRow, bool, set[tuple[str, date]]]:
+    """单笔“更正”原语（调用方已持有事务与 advisory 锁）。
+
+    返回 (应用后的乘次行, 是否幂等重放, 新旧受影响账户运营日集合)。
+    """
+    new_day = op_day_of(boarding_at)
+    existing = conn.execute(
+        "SELECT * FROM trips WHERE trip_id = %s FOR UPDATE",
+        (trip_id,),
+    ).fetchone()
+    if existing is None:
+        raise not_found("UNKNOWN_TRIP",
+                        f"cannot correct unknown trip {trip_id!r}")
+    if existing["status"] == "cancelled":
+        raise conflict("TRIP_NOT_ACTIVE",
+                       f"trip {trip_id!r} is cancelled and cannot be corrected")
+    if existing["version"] != expected_version:
+        raise conflict("VERSION_CONFLICT",
+                       f"expected version {existing['version']}, "
+                       f"got {expected_version}")
+
+    old_day = existing["op_day"]
+    if _same_content(existing, account_id, boarding_at, fare):
+        return existing, True, set()  # 内容一致：幂等重放
+
+    row = conn.execute(
+        """UPDATE trips SET account_id = %s, boarding_at = %s,
+               base_fare_cents = %s, op_day = %s,
+               version = version + 1, updated_at = now()
+           WHERE trip_id = %s RETURNING *""",
+        (account_id, boarding_at, fare, new_day, trip_id),
+    ).fetchone()
+    _append_ledger(conn, account_id=account_id, op_day=new_day,
+                   event_type="trip_corrected", delta=0,
+                   charged_after=None,
+                   reason=(f"trip corrected v{existing['version']}->"
+                           f"v{row['version']}"),
+                   trip_id=trip_id)
+    # 跨账户/跨日更正时旧账户旧日也要冲销重算
+    affected = {(existing["account_id"], old_day), (account_id, new_day)}
+    return row, False, affected
+
+
+def _cancel_locked(conn: psycopg.Connection, trip_id: str,
+                   expected_version: int
+                   ) -> tuple[TripRow, bool, set[tuple[str, date]]]:
+    """单笔“撤销”原语（调用方已持有事务与 advisory 锁）。
+
+    返回 (应用后的乘次行, 是否幂等重放, 受影响账户运营日集合)。
+    """
+    existing = conn.execute(
+        "SELECT * FROM trips WHERE trip_id = %s FOR UPDATE",
+        (trip_id,),
+    ).fetchone()
+    if existing is None:
+        raise not_found("UNKNOWN_TRIP",
+                        f"cannot cancel unknown trip {trip_id!r}")
+    if existing["version"] != expected_version:
+        raise conflict("VERSION_CONFLICT",
+                       f"expected version {existing['version']}, "
+                       f"got {expected_version}")
+    if existing["status"] == "cancelled":
+        return existing, True, set()  # 同版本重复撤销：幂等
+
+    row = conn.execute(
+        """UPDATE trips SET status = 'cancelled', updated_at = now()
+           WHERE trip_id = %s RETURNING *""",
+        (trip_id,),
+    ).fetchone()
+    _append_ledger(conn, account_id=row["account_id"], op_day=row["op_day"],
+                   event_type="trip_cancelled", delta=0,
+                   charged_after=None, reason="trip cancelled",
+                   trip_id=trip_id)
+    return row, False, {(row["account_id"], row["op_day"])}
+
+
 def submit_trip(trip_id: str, account_id: str,
                 boarding_at: datetime, fare: int) -> tuple[TripRow, bool]:
     """提交乘车记录。返回 (记录, 是否幂等重传)。"""
-    op_day = op_day_of(boarding_at)
     with db.pool.connection() as conn:
         with conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_KEY,))
-            existing = conn.execute(
-                "SELECT * FROM trips WHERE trip_id = %s FOR UPDATE",
-                (trip_id,),
-            ).fetchone()
-
-            if existing is not None:
-                if _same_content(existing, account_id, boarding_at, fare):
-                    return existing, True  # 同号同内容：幂等，直接回当前状态
-                raise conflict(
-                    "IDEMPOTENCY_CONFLICT",
-                    f"trip {trip_id!r} already exists with different content; "
-                    "use POST /trips/{trip_id}/correct to amend it",
-                )
-
-            row = conn.execute(
-                """INSERT INTO trips
-                       (trip_id, account_id, boarding_at, base_fare_cents,
-                        status, op_day, version)
-                   VALUES (%s, %s, %s, %s, 'active', %s, 1)
-                   RETURNING *""",
-                (trip_id, account_id, boarding_at, fare, op_day),
-            ).fetchone()
-            _append_ledger(conn, account_id=account_id, op_day=op_day,
-                           event_type="trip_posted", delta=0,
-                           charged_after=None,
-                           reason="trip submitted", trip_id=trip_id)
-            _recalc_day(conn, account_id, op_day,
-                        reason=f"trip_posted:{trip_id}", trip_id=trip_id)
-            return row, False
+            row, idem, affected = _submit_locked(
+                conn, trip_id, account_id, boarding_at, fare)
+            for acc, day in _affected_sorted(affected):
+                _recalc_day(conn, acc, day,
+                            reason=f"trip_posted:{trip_id}", trip_id=trip_id)
+            return row, idem
 
 
 def correct_trip(trip_id: str, account_id: str,
                  boarding_at: datetime, fare: int,
                  expected_version: int) -> tuple[TripRow, bool]:
     """更正乘车记录（凭乘次号 + 当前版本）。返回 (记录, 是否幂等重放)。"""
-    new_day = op_day_of(boarding_at)
     with db.pool.connection() as conn:
         with conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_KEY,))
-            existing = conn.execute(
-                "SELECT * FROM trips WHERE trip_id = %s FOR UPDATE",
-                (trip_id,),
-            ).fetchone()
-            if existing is None:
-                raise not_found("UNKNOWN_TRIP",
-                                f"cannot correct unknown trip {trip_id!r}")
-            if existing["status"] == "cancelled":
-                raise conflict("TRIP_NOT_ACTIVE",
-                               f"trip {trip_id!r} is cancelled and cannot be corrected")
-            if existing["version"] != expected_version:
-                raise conflict("VERSION_CONFLICT",
-                               f"expected version {existing['version']}, "
-                               f"got {expected_version}")
-
-            old_day = existing["op_day"]
-            if _same_content(existing, account_id, boarding_at, fare):
-                return existing, True  # 内容一致：幂等重放
-
-            row = conn.execute(
-                """UPDATE trips SET account_id = %s, boarding_at = %s,
-                       base_fare_cents = %s, op_day = %s,
-                       version = version + 1, updated_at = now()
-                   WHERE trip_id = %s RETURNING *""",
-                (account_id, boarding_at, fare, new_day, trip_id),
-            ).fetchone()
-            _append_ledger(conn, account_id=account_id, op_day=new_day,
-                           event_type="trip_corrected", delta=0,
-                           charged_after=None,
-                           reason=(f"trip corrected v{existing['version']}->"
-                                   f"v{row['version']}"),
-                           trip_id=trip_id)
-            # 受影响的（账户 × 运营日）全部重算；账户变更时旧账户旧日也要冲销重算
-            affected = {(existing["account_id"], old_day), (account_id, new_day)}
-            for acc, day in affected:
+            row, idem, affected = _correct_locked(
+                conn, trip_id, account_id, boarding_at, fare, expected_version)
+            for acc, day in _affected_sorted(affected):
                 _recalc_day(conn, acc, day,
                             reason=f"trip_corrected:{trip_id}", trip_id=trip_id)
-            return row, False
+            return row, idem
 
 
 def cancel_trip(trip_id: str, expected_version: int) -> tuple[TripRow, bool]:
@@ -540,30 +604,76 @@ def cancel_trip(trip_id: str, expected_version: int) -> tuple[TripRow, bool]:
     with db.pool.connection() as conn:
         with conn.transaction():
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_KEY,))
-            existing = conn.execute(
-                "SELECT * FROM trips WHERE trip_id = %s FOR UPDATE",
-                (trip_id,),
-            ).fetchone()
-            if existing is None:
-                raise not_found("UNKNOWN_TRIP",
-                                f"cannot cancel unknown trip {trip_id!r}")
-            if existing["version"] != expected_version:
-                raise conflict("VERSION_CONFLICT",
-                               f"expected version {existing['version']}, "
-                               f"got {expected_version}")
-            if existing["status"] == "cancelled":
-                return existing, True  # 同版本重复撤销：幂等
+            row, idem, affected = _cancel_locked(conn, trip_id, expected_version)
+            for acc, day in _affected_sorted(affected):
+                _recalc_day(conn, acc, day,
+                            reason=f"trip_cancelled:{trip_id}", trip_id=trip_id)
+            return row, idem
 
-            row = conn.execute(
-                """UPDATE trips SET status = 'cancelled', updated_at = now()
-                   WHERE trip_id = %s RETURNING *""",
-                (trip_id,),
-            ).fetchone()
-            _append_ledger(conn, account_id=row["account_id"], op_day=row["op_day"],
-                           event_type="trip_cancelled", delta=0,
-                           charged_after=None, reason="trip cancelled",
-                           trip_id=trip_id)
-            _recalc_day(conn, row["account_id"], row["op_day"],
-                        reason=f"trip_cancelled:{trip_id}", trip_id=trip_id)
-            return row, False
 
+def submit_batch(operations: list[Any]) -> dict[str, Any]:
+    """清分方补录批量原子结算：1～100 项提交/更正/撤销按输入顺序执行。
+
+    - 批次内同一乘次号不得出现两次（结构前置校验）；
+    - 逐项沿用单笔的幂等/版本/状态规则，任一项非法或冲突 -> 整批回滚
+      （乘次、换乘组、日结、流水均不改），错误体携带出错下标与原业务错误码；
+    - 非幂等乘次生命周期事件按输入顺序追加；
+    - 汇总新旧受影响的（账户 × 运营日），每个日按其适用规则只重算一次；
+    - 与全部单笔写入及规则回溯发布共用同一事务级 advisory 锁，严格串行，
+      读侧（REPEATABLE READ 快照）看不到部分结果。
+    """
+    # 批次内乘次号唯一性（op 项必须带 trip_id，已由模型校验）
+    seen: set[str] = set()
+    for i, op in enumerate(operations):
+        if op.trip_id in seen:
+            raise unprocessable(
+                "DUPLICATE_TRIP_IN_BATCH",
+                f"trip_id {op.trip_id!r} appears more than once in the batch; "
+                "each trip may be operated on at most once per batch",
+                index=i, trip_id=op.trip_id)
+        seen.add(op.trip_id)
+
+    items: list[dict[str, Any]] = []
+    affected_days: set[tuple[str, date]] = set()
+    all_idempotent = True
+
+    with db.pool.connection() as conn:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_KEY,))
+            for i, op in enumerate(operations):
+                try:
+                    if op.op == "submit":
+                        row, idem, affected = _submit_locked(
+                            conn, op.trip_id, op.account_id,
+                            op.boarding_at, op.base_fare_cents)
+                    elif op.op == "correct":
+                        row, idem, affected = _correct_locked(
+                            conn, op.trip_id, op.account_id,
+                            op.boarding_at, op.base_fare_cents,
+                            op.expected_version)
+                    else:  # cancel
+                        row, idem, affected = _cancel_locked(
+                            conn, op.trip_id, op.expected_version)
+                except ApiError as e:
+                    # 原业务错误码 + 出错位置；事务随上下文退出整体回滚
+                    raise ApiError(e.status_code, e.code, e.message,
+                                   index=i, trip_id=op.trip_id) from e
+                if not idem:
+                    all_idempotent = False
+                    affected_days |= affected
+                items.append({"index": i, "op": op.op,
+                              "trip_id": op.trip_id, "idempotent": idem,
+                              "trip": trip_view(row)})
+
+            # 新旧受影响日并集：每日只按其适用规则重算一次（确定序以固定流水序）
+            charged: dict[tuple[str, date], int] = {}
+            for acc, day in _affected_sorted(affected_days):
+                charged[(acc, day)] = _recalc_day(
+                    conn, acc, day, reason="batch_settlement", trip_id=None)
+
+    day_views = [
+        {"account_id": acc, "op_day": day, "charged_cents": charged[(acc, day)]}
+        for acc, day in _affected_sorted(affected_days)
+    ]
+    return {"idempotent": all_idempotent,
+            "items": items, "affected_days": day_views}

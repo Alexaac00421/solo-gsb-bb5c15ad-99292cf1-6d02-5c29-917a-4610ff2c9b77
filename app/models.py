@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -202,3 +202,103 @@ class LedgerView(BaseModel):
     charged_after_cents: int | None
     reason: str
     created_at: str
+
+
+# ---------------------------------------------------------------- 批量结算
+
+MAX_BATCH_SIZE = 100
+
+
+class BatchSubmitIn(TripIn):
+    """批量中的“提交”项：字段与 POST /trips 一致，另带判别字段 op。"""
+    op: Literal["submit"] = "submit"
+
+
+class BatchCorrectIn(BaseModel):
+    """批量中的“更正”项：字段与 POST /trips/{trip_id}/correct 一致。"""
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["correct"] = "correct"
+    trip_id: str
+    account_id: str
+    boarding_at: datetime
+    base_fare_cents: int
+    expected_version: int = Field(..., ge=1,
+                                  description="乘次当前版本，陈旧版本将被拒绝")
+
+    @field_validator("trip_id")
+    @classmethod
+    def _tid(cls, v: Any) -> str:
+        return _validate_text(v, "trip_id")
+
+    @field_validator("account_id")
+    @classmethod
+    def _acc(cls, v: Any) -> str:
+        return _validate_text(v, "account_id")
+
+    @field_validator("boarding_at")
+    @classmethod
+    def _time(cls, v: Any) -> datetime:
+        return _validate_boarding_at(v)
+
+    @field_validator("base_fare_cents")
+    @classmethod
+    def _fare(cls, v: Any) -> int:
+        return _validate_fare(v)
+
+
+class BatchCancelIn(BaseModel):
+    """批量中的“撤销”项：字段与 POST /trips/{trip_id}/cancel 一致。"""
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["cancel"] = "cancel"
+    trip_id: str
+    expected_version: int = Field(..., ge=1,
+                                  description="乘次当前版本，陈旧版本将被拒绝")
+
+    @field_validator("trip_id")
+    @classmethod
+    def _tid(cls, v: Any) -> str:
+        return _validate_text(v, "trip_id")
+
+
+# 判别联合（discriminator=op）：op 缺失/非法或项内字段非法时，
+# pydantic 报错 loc 为 ("operations", i, ...)，异常处理器据此定位出错下标。
+BatchOperation = Annotated[
+    Union[BatchSubmitIn, BatchCorrectIn, BatchCancelIn],
+    Field(discriminator="op"),
+]
+
+
+class BatchSettleIn(BaseModel):
+    """清分方补录批量请求：1～100 项，每项对应一次现有单笔操作；
+    同一乘次号在批次内不得出现两次。整批原子：任一项非法/冲突则全部不改。"""
+    model_config = ConfigDict(extra="forbid")
+
+    operations: list[BatchOperation] = Field(
+        ..., min_length=1, max_length=MAX_BATCH_SIZE,
+        description="按输入顺序执行的提交/更正/撤销操作（1～100 项）")
+
+
+class BatchItemResult(BaseModel):
+    """逐项结果：下标、操作类型、幂等标记、该项应用后的乘次状态。"""
+    index: int
+    op: Literal["submit", "correct", "cancel"]
+    trip_id: str
+    idempotent: bool
+    trip: TripView
+
+
+class AffectedDayView(BaseModel):
+    """批量重算后的受影响日实收（新旧账户与新旧运营日并集，每日只重算一次）。"""
+    account_id: str
+    op_day: date
+    charged_cents: int          # 批量后该日实收（当日无有效乘次为 0）
+
+
+class BatchSettleView(BaseModel):
+    idempotent: bool            # 全部项均为幂等重放（无任何改动）时为 true
+    items: list[BatchItemResult]
+    affected_days: list[AffectedDayView]
+
+

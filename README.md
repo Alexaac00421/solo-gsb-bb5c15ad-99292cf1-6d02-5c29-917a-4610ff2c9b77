@@ -3,7 +3,8 @@
 Python 3 / FastAPI + PostgreSQL 实现的公交换乘票价清分（fare clearing）服务。
 支持乘车记录幂等提交、04:00 运营日界、90 分钟链式换乘归组、组内取最高票价、
 单账户单日实收封顶、迟到补录与跨日更正的自动重算、版本化更正/撤销、
-运营方按运营日发布的换乘时限与单日封顶规则（回溯发布自动重算覆盖区间），
+运营方按运营日发布的换乘时限与单日封顶规则（回溯发布自动重算覆盖区间）、
+清分方补录文件 1～100 项提交/更正/撤销的批量原子结算，
 以及按提交顺序递增、仅追加、游标翻页的原子流水。
 
 ## 一条命令启动
@@ -81,6 +82,27 @@ bash scripts/examples.sh            # 默认 http://localhost:8080
   同号异内容返回 `409 IDEMPOTENCY_CONFLICT`。
 - **更正 / 撤销**：更正须携带乘次当前 `version`，成功后版本 +1；撤销不推进版本，同版本重复撤销幂等。
   未知乘次返回 `404 UNKNOWN_TRIP`，版本不匹配返回 `409 VERSION_CONFLICT`。
+- **批量原子结算（清分方补录文件）**：`POST /trips/batch` 在**单个事务**内按输入顺序执行
+  1～100 项 `submit` / `correct` / `cancel`，逐项沿用上述幂等、版本与状态规则。
+  - 每项携带其对应单笔操作的字段（`submit` 同 `POST /trips`；`correct` 同更正接口，
+    路径上的 `trip_id` 放入项内；`cancel` 的 `expected_version` 也在项内）。
+  - **同一乘次号在一个批次内不得出现两次**（`422 DUPLICATE_TRIP_IN_BATCH`）；
+    因此批次中的更正/撤销针对此前已存在的乘次（补录的典型场景）。
+  - 任一项非法（422 字段错误）或业务冲突（404/409）则**整批不改**乘次、换乘组、
+    日结与流水，错误体返回出错项下标 `index`（从 0 起）、`trip_id` 及**原单笔业务错误码**；
+    回滚不消耗流水序号（seq 仍无空洞）。
+  - 成功后非幂等乘次生命周期事件（`trip_posted`/`trip_corrected`/`trip_cancelled`）
+    **按输入顺序**追加；汇总新旧受影响的账户与运营日（含跨日/跨账户更正的旧端），
+    **每个（账户 × 运营日）只按其适用规则重算一次**，实收变化沿用既有
+    `day_reversal` / `day_charge` 成对流水（`reason` 含 `batch_settlement`，
+    金额事件 `trip_id` 为 `null`）。
+  - 响应按输入顺序给出逐项乘次状态与 `idempotent` 标记，并汇总
+    `affected_days`（每项含 `account_id`、`op_day`、批量后 `charged_cents`，
+    当日无有效乘次为 `0`）；顶层 `idempotent=true` 表示整批均为幂等重放、
+    无任何改动与新流水。
+  - 批量与全部单笔写入及规则回溯发布共用同一事务级 advisory 锁严格串行；
+    读接口取 `REPEATABLE READ` 快照，读者只能看到批量前或批量后的完整状态。
+  - 既有单笔接口的请求/响应、错误格式与流水结构保持不变。
 - **重算**：迟到记录或更正（含跨日更正、账户变更）会重算所有受影响的（账户 × 运营日）。
   当日实收发生变化时，流水成对追加 `day_reversal`（冲销旧日金额）与 `day_charge`（记入新金额）；
   实收不变不产生金额流水。
@@ -135,6 +157,72 @@ curl -X POST http://localhost:8080/trips/T1/correct \
 
 成功 `200`，乘次置为 `cancelled` 并从换乘组与日结中剔除、重算当日；
 同版本重复撤销幂等。
+
+### `POST /trips/batch` —— 清分方补录批量原子结算
+
+请求体为 `{"operations": [...]}`，1～100 项，按数组顺序在**一个事务**内执行。
+每项用 `op` 区分操作，其余字段与对应单笔接口完全一致：
+
+| `op` | 字段 |
+| --- | --- |
+| `submit` | `trip_id`、`account_id`、`boarding_at`、`base_fare_cents` |
+| `correct` | `trip_id`、`account_id`、`boarding_at`、`base_fare_cents`、`expected_version` |
+| `cancel` | `trip_id`、`expected_version` |
+
+> 一个批次内同一 `trip_id` 只能出现一次；批次中的更正/撤销用于处理此前已存在的乘次。
+
+```bash
+curl -X POST http://localhost:8080/trips/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"operations": [
+    {"op": "submit",  "trip_id": "B2", "account_id": "A001",
+     "boarding_at": "2026-10-08T08:00:00+08:00", "base_fare_cents": 900},
+    {"op": "correct", "trip_id": "B0", "account_id": "A001",
+     "boarding_at": "2026-10-08T09:00:00+08:00", "base_fare_cents": 600,
+     "expected_version": 1},
+    {"op": "cancel",  "trip_id": "B1", "expected_version": 1}
+  ]}'
+```
+
+成功 `200`：逐项结果按输入顺序返回，另汇总新旧受影响日的批量后实收：
+
+```json
+{
+  "idempotent": false,
+  "items": [
+    {"index": 0, "op": "submit", "trip_id": "B2", "idempotent": false,
+     "trip": {"trip_id": "B2", "account_id": "A001",
+              "boarding_at": "2026-10-08T08:00:00+08:00",
+              "base_fare_cents": 900, "status": "active",
+              "op_day": "2026-10-08", "version": 1}},
+    {"index": 1, "op": "correct", "trip_id": "B0", "idempotent": false,
+     "trip": {"trip_id": "B0", "...": "...", "version": 2}},
+    {"index": 2, "op": "cancel", "trip_id": "B1", "idempotent": false,
+     "trip": {"trip_id": "B1", "...": "...", "status": "cancelled"}}
+  ],
+  "affected_days": [
+    {"account_id": "A001", "op_day": "2026-10-08", "charged_cents": 900}
+  ]
+}
+```
+
+- 任一项非法或冲突时**整批回滚**（乘次、换乘组、日结、流水均不改），错误体在统一
+  格式上额外给出出错位置，错误码沿用单笔原码（如 `VERSION_CONFLICT`、
+  `UNKNOWN_TRIP`、`IDEMPOTENCY_CONFLICT`、`TRIP_NOT_ACTIVE`）：
+
+  ```json
+  {"error": {"code": "VERSION_CONFLICT",
+             "message": "expected version 2, got 1",
+             "index": 1, "trip_id": "B0"}}
+  ```
+- 批量结构错误同样带 `index`：字段非法沿用 `INVALID_TIME` / `INVALID_FARE` /
+  `INVALID_VERSION` 等码；`op` 非法为 `INVALID_OP`；条目结构非法为 `INVALID_BATCH`；
+  列表为空/超过 100 项/缺失为 `INVALID_BATCH`；批内乘次号重复为
+  `DUPLICATE_TRIP_IN_BATCH`（指向第二次出现的下标）。
+- 整批均为幂等重放时顶层 `idempotent=true`，`affected_days` 为空，且不产生任何流水。
+- 金额流水结构不变：批量重算产生的成对 `day_reversal` / `day_charge`
+  `reason` 含 `batch_settlement`、`trip_id` 为 `null`，仍可经
+  `GET /accounts/{account_id}/ledger` 按序翻页查询。
 
 ### `GET /trips/{trip_id}` —— 查询乘次状态（含版本）
 
@@ -296,7 +384,14 @@ curl http://localhost:8080/rules
 | 422 | `INVALID_WINDOW` | 换乘时限不是正整数 |
 | 422 | `INVALID_CAP` | 封顶分值不是非负整数 |
 | 422 | `INVALID_TRIP_ID` / `INVALID_ACCOUNT_ID` / `INVALID_VERSION` | 对应字段非法 |
+| 422 | `INVALID_OP` | 批量项 `op` 不是 `submit`/`correct`/`cancel`（错误体含 `index`） |
+| 422 | `INVALID_BATCH` | 批量请求结构非法：`operations` 缺失/为空/超过 100 项、条目不是对象、条目内多余字段等 |
+| 422 | `DUPLICATE_TRIP_IN_BATCH` | 同一乘次号在一个批次内出现两次（错误体含 `index` 与 `trip_id`） |
 | 422 | `INVALID_REQUEST` | 其它请求体校验错误（多余字段等） |
+
+> 批量结算（`POST /trips/batch`）的 4xx 错误体在统一格式上额外携带
+> `index`（出错项在 `operations` 中的下标，从 0 起）与 `trip_id`，
+> 业务错误码（404/409）与单笔接口完全一致。
 
 ## 本地开发（不使用 Docker）
 
@@ -319,14 +414,15 @@ pytest
 ```
 app/
   main.py        FastAPI 路由与异常映射
-  service.py     归组/重算/幂等/版本控制/流水/费率规则（事务核心）
-  models.py      请求响应模型与输入校验
+  service.py     归组/重算/幂等/版本控制/流水/费率规则/批量原子结算（事务核心）
+  models.py      请求响应模型与输入校验（含批量判别联合）
   db.py          连接池与幂等建表
   schema.sql     表、索引、append-only 触发器
   timeutil.py    北京时间与 04:00 运营日界
   config.py      环境变量配置（默认窗口/封顶）
-scripts/examples.sh   端到端调用示例（含规则发布）
+scripts/examples.sh   端到端调用示例（含规则发布与批量原子结算）
 docker-compose.yml / Dockerfile / docker-entrypoint.sh
 tests/test_clearing.py 乘次/账单/流水业务规则与并发测试
 tests/test_rules.py    按运营日规则发布、覆盖区间、回溯重算与并发测试
+tests/test_batch.py    补录批量原子结算、整批回滚定位、幂等重放与并发可见性测试
 ```

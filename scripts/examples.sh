@@ -101,3 +101,71 @@ echo "== 15) 查询指定运营日适用规则与覆盖区间 =="
 curl -s "$BASE/rules/2026-10-06" | j; echo
 echo "-- 全部已发布规则（按生效日升序） --"
 curl -s "$BASE/rules" | j; echo
+
+# ---------------------------------------------------------------
+# 清分方补录批量原子结算（POST /trips/batch，1～100 项一次事务）
+# ---------------------------------------------------------------
+B="demo-batch-001"
+
+echo "== 16) 预置两笔既有乘次（供批量中更正/撤销） =="
+for spec in "B0 2026-10-08T09:00:00+08:00 500" \
+            "B1 2026-10-08T12:00:00+08:00 700"; do
+  set -- $spec
+  curl -s -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+    \"trip_id\": \"$1\", \"account_id\": \"$B\",
+    \"boarding_at\": \"$2\", \"base_fare_cents\": $3
+  }" > /dev/null
+done
+echo "预置完成：B0(09:00,500)、B1(12:00,700)"
+
+echo "== 17) 一次批量原子结算：补录 B2(08:00,900) + 更正 B0(500->600,v1) + 撤销 B1 =="
+curl -s -X POST "$BASE/trips/batch" -H 'Content-Type: application/json' -d "{
+  \"operations\": [
+    {\"op\": \"submit\",  \"trip_id\": \"B2\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T08:00:00+08:00\", \"base_fare_cents\": 900},
+    {\"op\": \"correct\", \"trip_id\": \"B0\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T09:00:00+08:00\", \"base_fare_cents\": 600,
+     \"expected_version\": 1},
+    {\"op\": \"cancel\",  \"trip_id\": \"B1\", \"expected_version\": 1}
+  ]
+}" | j; echo
+echo "-- 日结：B2(08:00) 与 B0(09:00) 间隔恰为60分钟（10-08 适用第13步发布的规则：窗口60/封顶500），同组组费900封顶实收500；B1 已撤销剔除 --"
+curl -s "$BASE/accounts/$B/days/2026-10-08" | j; echo
+
+echo "== 18) 整批幂等重放（同内容提交/同版本更正重放/重复撤销 -> 全 idempotent，无流水） =="
+curl -s -X POST "$BASE/trips/batch" -H 'Content-Type: application/json' -d "{
+  \"operations\": [
+    {\"op\": \"submit\",  \"trip_id\": \"B2\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T08:00:00+08:00\", \"base_fare_cents\": 900},
+    {\"op\": \"correct\", \"trip_id\": \"B0\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T09:00:00+08:00\", \"base_fare_cents\": 600,
+     \"expected_version\": 2},
+    {\"op\": \"cancel\",  \"trip_id\": \"B1\", \"expected_version\": 1}
+  ]
+}" | j; echo
+
+echo "== 19) 任一项冲突整批回滚（B0 现为 v2，第 1 项带陈旧 v1 -> 409 VERSION_CONFLICT；第 0/2 项也不落库） =="
+curl -s -X POST "$BASE/trips/batch" -H 'Content-Type: application/json' -d "{
+  \"operations\": [
+    {\"op\": \"submit\", \"trip_id\": \"B8\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T20:00:00+08:00\", \"base_fare_cents\": 100},
+    {\"op\": \"correct\", \"trip_id\": \"B0\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T09:00:00+08:00\", \"base_fare_cents\": 650,
+     \"expected_version\": 1},
+    {\"op\": \"submit\", \"trip_id\": \"B9\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T21:00:00+08:00\", \"base_fare_cents\": 100}
+  ]
+}" | j; echo
+echo "-- B8/B9 均不应存在（整批回滚）；B0 仍为 v2、日结不变 --"
+curl -s -o /dev/null -w "GET /trips/B8 -> HTTP %{http_code} (期望 404)\n" "$BASE/trips/B8"
+curl -s -o /dev/null -w "GET /trips/B9 -> HTTP %{http_code} (期望 404)\n" "$BASE/trips/B9"
+curl -s "$BASE/accounts/$B/days/2026-10-08" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("回滚后日结 charged_cents =", d["charged_cents"], "（仍为 500）")'
+
+echo "== 20) 批次内同一乘次号出现两次（422 DUPLICATE_TRIP_IN_BATCH，定位 index=1） =="
+curl -s -X POST "$BASE/trips/batch" -H 'Content-Type: application/json' -d "{
+  \"operations\": [
+    {\"op\": \"submit\", \"trip_id\": \"DUP\", \"account_id\": \"$B\",
+     \"boarding_at\": \"2026-10-08T07:00:00+08:00\", \"base_fare_cents\": 100},
+    {\"op\": \"cancel\", \"trip_id\": \"DUP\", \"expected_version\": 1}
+  ]
+}" | j; echo
