@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fare
+      POSTGRES_PASSWORD: farepass
+      POSTGRES_DB: fareclearing
+      TZ: Asia/Shanghai
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fare -d fareclearing"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://fare:farepass@db:5432/fareclearing
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8080"
+      DAY_BOUNDARY_HOUR: "4"
+      TRANSFER_WINDOW_MINUTES: "90"
+      DAILY_CAP_CENTS: "2000"
+      TZ: Asia/Shanghai
+    ports:
+      - "${APP_PORT:-8080}:8080"
+
+volumes:
+  pgdata:
